@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"sync"
 )
 
@@ -11,28 +10,18 @@ type Unit struct {
 	Output int64
 }
 
-var verbose bool
-
-func SetVerboseLogging(_verbose bool) {
-	verbose = _verbose
-}
-
-func log(name string, input int64) {
-	if verbose {
-		fmt.Println(name+":", input)
-	}
-}
-
 func NumbersSource(ctx context.Context, name string, size int64) (<-chan Unit, <-chan error, error) {
+	logOpen(name)
 	out := make(chan Unit)
 	errc := make(chan error, 1)
 	go func() {
 		defer close(out)
 		defer close(errc)
+		defer logClose(name)
 
 		var i int64
 		for i = 0; i < size; i++ {
-			log(name, i)
+			logInput(name, i)
 			newUnit := Unit{i, i}
 
 			select {
@@ -52,13 +41,15 @@ func NumbersSource(ctx context.Context, name string, size int64) (<-chan Unit, <
 // chan<- values are entering the channel
 
 func NumbersSquare(ctx context.Context, name string, in <-chan Unit) (<-chan Unit, <-chan error, error) {
+	logOpen(name)
 	out := make(chan Unit)
 	errc := make(chan error, 1)
 	go func() {
 		defer close(out)
 		defer close(errc)
+		defer logClose(name)
 		for unit := range in {
-			log(name, unit.Input)
+			logInput(name, unit.Input)
 			//Perform the transformation here:
 			newOutput := unit.Output * unit.Output
 			newUnit := Unit{unit.Input, newOutput}
@@ -73,18 +64,99 @@ func NumbersSquare(ctx context.Context, name string, in <-chan Unit) (<-chan Uni
 	return out, errc, nil
 }
 
+func NumbersFanOut(ctx context.Context, name string, in <-chan Unit, fanFactor int) ([]<-chan Unit, <-chan error, error) {
+	logOpen(name)
+	outs := make([]chan Unit, fanFactor)
+	retOuts := make([]<-chan Unit, fanFactor)
+	errc := make(chan error, 1)
+
+	//Init all output channels
+	for i := 0; i < fanFactor; i++ {
+		out := make(chan Unit)
+		outs[i] = out
+		retOuts[i] = out
+	}
+
+	//Start the go routine which fans the work to fanFactor goroutines
+	go func() {
+		defer func() {
+			for i := range outs {
+				close(outs[i])
+			}
+		}()
+		defer close(errc)
+		defer logClose(name)
+
+		i := 0
+
+		//Fan it out - we will do round robin fan out here. distribute work evenly among all channels.
+		//You could however do a dynamic select and pass to the next available channel - https://play.golang.org/p/8zwvSk4kjx
+		for unit := range in {
+			channelIndex := i % fanFactor
+			out := outs[channelIndex]
+
+			select {
+			case out <- unit:
+			case <-ctx.Done():
+				return
+			}
+
+			i++
+		}
+	}()
+
+	return retOuts, errc, nil
+}
+
+func NumbersFanIn(ctx context.Context, name string, ins ...<-chan Unit) (<-chan Unit, <-chan error, error) {
+	logOpen(name)
+	out := make(chan Unit)
+	errc := make(chan error, 1)
+	var wg sync.WaitGroup
+
+	//Add all the channels to the wait group
+	wg.Add(len(ins))
+
+	//Start receiver for each input channel
+	for _, inputChannel := range ins { //Avoid common mistake, inputChannel reference will change so we need to copy it
+		go func(in <-chan Unit) {
+			defer wg.Done()
+			for unit := range in {
+				logInput(name, unit.Input)
+				select {
+				case out <- unit:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}(inputChannel)
+	}
+
+	//Create a cleanup function which waits until all the recievers have finished to close the 'out' and 'errc' channels
+	go func() {
+		wg.Wait()
+		close(out)
+		close(errc)
+		logClose(name)
+	}()
+
+	return out, errc, nil
+}
+
 func NumbersSink(ctx context.Context, name string, in <-chan Unit) (<-chan []Unit, <-chan error, error) {
+	logOpen(name)
 	out := make(chan []Unit, 1)
 	errc := make(chan error, 1)
 	go func() {
 		defer close(out)
 		defer close(errc)
+		defer logClose(name)
 
 		results := make([]Unit, 0, 0)
 
 		//For each value, receive it and append it
 		for unit := range in {
-			log(name, unit.Input)
+			logInput(name, unit.Input)
 			results = append(results, unit)
 		}
 
@@ -97,52 +169,4 @@ func NumbersSink(ctx context.Context, name string, in <-chan Unit) (<-chan []Uni
 		}
 	}()
 	return out, errc, nil
-}
-
-// WaitForPipeline waits for results from all error channels.
-// It returns early on the first error.
-func WaitForPipeline(errs ...<-chan error) error {
-	errc := MergeErrors(errs...)
-	for err := range errc {
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// MergeErrors - takes an array of error channels, waits on all of them and merges their outputs into a single error channel.
-// This error channel will be closed when all the error channels in the input array are closed by their pipeline stages.
-// Closing the resulting error channel is also a sign that the entire pipeline has finished executing.
-func MergeErrors(cs ...<-chan error) <-chan error {
-	var wg sync.WaitGroup
-
-	// We must ensure that the output channel has the capacity to
-	// hold as many errors
-	// as there are error channels.
-	// This will ensure that it never blocks, even
-	// if WaitForPipeline returns early.
-
-	out := make(chan error, len(cs))
-
-	// Start an reciever goroutine for each input channel in cs.  output
-	// copies values from c to out until c is closed, then calls
-	// wg.Done.
-	wg.Add(len(cs))
-	for _, errorChannel := range cs {
-		go func(c <-chan error) {
-			for n := range c {
-				out <- n
-			}
-			wg.Done()
-		}(errorChannel)
-	}
-
-	// Start a goroutine to close out once all the output goroutines
-	// are done.  This must start after the wg.Add call.
-	go func() {
-		wg.Wait()
-		close(out)
-	}()
-	return out
 }
